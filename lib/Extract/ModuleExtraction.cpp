@@ -39,7 +39,7 @@ char ModuleExtractor::ID = 0;
 
 using ModulePtrT = std::unique_ptr<Module>;
 
-static ModulePtrT copyModule(ValueToValueMapTy &VMap, Module &M) {
+static ModulePtrT copyModule(Module &M) {
   auto NewM = ModulePtrT(new Module(M.getModuleIdentifier(), M.getContext()));
   NewM->setDataLayout(M.getDataLayout());
   NewM->setTargetTriple(M.getTargetTriple());
@@ -688,7 +688,7 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     Module *M = F->getParent();
     StringRef ModuleName = F->getParent()->getModuleIdentifier();
     StringRef FromName = F->getName();
-    ModulePtrT PrototypeM = copyModule(VMap, *M);
+    ModulePtrT PrototypeM = copyModule(*M);
 
     PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
                                     ".prototype");
