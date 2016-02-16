@@ -712,10 +712,20 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     // tries to detect that again.
     collectRegressionTest(FromName, ModStr);
 
+    // We create a copy of F to use as a fallback function for the
+    // instrumented version of F. The main reason for this is that
+    // later in this function, we will replace all calls to F with
+    // a call to an instrumented version of F, and thus we must
+    // not call F directly from within the instrumented version.
+    ValueToValueMapTy VMap2;
+    FunctionCloner<CopyCreator, IgnoreSource, IgnoreTarget> PlainFunctionCloner(VMap2, M);
+    PlainFunctionCloner.setSource(F);
+    Function *FallbackCopy = PlainFunctionCloner.start();
+
     InstrumentingFunctionCloner InstCloner(VMap, M);
     InstCloner.setSource(ProtoF);
     InstCloner.setPrototype(Prototype);
-    InstCloner.setFallback(F);
+    InstCloner.setFallback(FallbackCopy);
 
     Function *InstF = InstCloner.start(/* RemapCalls */ true);
     InstF->addFnAttr(Attribute::OptimizeNone);
