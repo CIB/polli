@@ -455,7 +455,7 @@ struct InstrumentEndpoint {
    * @param Prototype A prototype value that gets passed to the JIT as string.
    * @return void
    */
-  void setPrototype(Value *Prototype) { PrototypeF = Prototype; }
+  void setPrototype(Function *PrototypeFunction, Value *PrototypeValue) { PrototypeF = PrototypeFunction; PrototypeV = PrototypeValue; }
 
   /**
    * @brief Setter for a fallback function that will be called.
@@ -535,6 +535,7 @@ struct InstrumentEndpoint {
     Value *Params = Builder.CreateAlloca(StackArrayT, Size1, "params");
 
     for (Argument &Arg : To->args()) {
+      llvm::outs() << "Argument: " << Arg << "\n";
       /* Get the appropriate slot in the parameters array and store
        * the stack slot in form of a i8*. */
       Value *ArrIdx = ConstantInt::get(Type::getInt32Ty(Ctx), i++);
@@ -555,7 +556,7 @@ struct InstrumentEndpoint {
     }
 
     // Append required global variables.
-    Function::arg_iterator GlobalArgs = From->arg_begin();
+    Function::arg_iterator GlobalArgs = PrototypeF->arg_begin();
     for (int j = 0; j < i; j++)
       GlobalArgs++;
     for (; i < argc; i++) {
@@ -574,7 +575,7 @@ struct InstrumentEndpoint {
     }
 
     SmallVector<Value *, 3> Args;
-    Args.push_back((PrototypeF) ? PrototypeF
+    Args.push_back((PrototypeV) ? PrototypeV
                                 : Builder.CreateGlobalStringPtr(To->getName()));
     Args.push_back(ParamC);
     Args.push_back(Builder.CreateBitCast(Params, Type::getInt8PtrTy(Ctx)));
@@ -601,7 +602,8 @@ struct InstrumentEndpoint {
   }
 
 private:
-  Value *PrototypeF;
+  Function *PrototypeF;
+  Value *PrototypeV;
   Function *FallbackF;
 };
 
@@ -635,7 +637,7 @@ static void clearFunctionLocalMetadata(Function *F) {
 }
 
 using InstrumentingFunctionCloner =
-    FunctionCloner<RemoveGlobalsPolicy, IgnoreSource, InstrumentEndpoint>;
+    FunctionCloner<CopyCreator, IgnoreSource, InstrumentEndpoint>;
 
 /**
  * @brief Extract all SCoP regions in a function into a new Module.
@@ -692,7 +694,7 @@ bool ModuleExtractor::runOnFunction(Function &F) {
 
     PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
                                     ".prototype");
-    Function *ProtoF = extractPrototypeM(VMap, *F, *PrototypeM);
+    auto ProtoF = extractPrototypeM(VMap, *F, *PrototypeM);
 
     llvm::legacy::PassManager MPM;
     MPM.add(llvm::createStripSymbolsPass(true));
@@ -723,11 +725,13 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     Function *FallbackCopy = PlainFunctionCloner.start();
 
     InstrumentingFunctionCloner InstCloner(VMap, M);
-    InstCloner.setSource(ProtoF);
-    InstCloner.setPrototype(Prototype);
+    InstCloner.setSource(F);
+    InstCloner.setPrototype(ProtoF, Prototype);
     InstCloner.setFallback(FallbackCopy);
 
-    Function *InstF = InstCloner.start(/* RemapCalls */ true);
+    Function *InstF = InstCloner.start(/* RemapCalls */ false);
+    llvm::outs() << "Original function: " << *F << "\n";
+    llvm::outs() << "Instrumented function: " << *InstF << "\n";
     InstF->addFnAttr(Attribute::OptimizeNone);
     InstF->addFnAttr(Attribute::NoInline);
 
@@ -736,6 +740,7 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     Instrumented++;
 
     F->replaceAllUsesWith(InstF);
+    llvm::outs() << "Module after: " << *InstF->getParent() << "\n";
   }
 
   return Changed;
