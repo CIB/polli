@@ -17,6 +17,7 @@
 #include "llvm/Analysis/RegionInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Analysis/ScalarEvolution.h"
 
 namespace polli {
 class JITScopDetection;
@@ -28,6 +29,7 @@ class JITScopDetection;
 class ScopMapper : public llvm::FunctionPass {
 public:
   using RegionSet = llvm::SetVector<const llvm::Region *>;
+  using ParamList = std::vector<const llvm::SCEV *>;
 
   llvm::iterator_range<RegionSet::iterator> regions() {
     return llvm::iterator_range<RegionSet::iterator>(MappableRegions.begin(),
@@ -42,6 +44,8 @@ public:
   void getAnalysisUsage(llvm::AnalysisUsage &AU) const override;
   void releaseMemory() override { MappableRegions.clear(); }
   bool runOnFunction(llvm::Function &F) override;
+
+  ParamList getRequiredParams(const Region* R);
   //@}
 private:
   //===--------------------------------------------------------------------===//

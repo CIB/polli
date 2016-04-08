@@ -7,6 +7,8 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CallGraph.h"
 #include "llvm/Analysis/RegionInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Bitcode/BitcodeWriterPass.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/BasicBlock.h"
@@ -459,6 +461,8 @@ struct InstrumentEndpoint {
    */
   void setPrototype(Value *Prototype) { PrototypeF = Prototype; }
 
+  void setRequiredParams(const std::set<unsigned>& Params) { RequiredParams = Params; }
+
   /**
    * @brief Setter for a fallback function that will be called.
    *
@@ -528,13 +532,29 @@ struct InstrumentEndpoint {
     int i = 0;
     Value *Size1 = ConstantInt::get(Type::getInt32Ty(Ctx), 1);
     Value *Idx0 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+    Value *Idx2 = ConstantInt::get(Type::getInt32Ty(Ctx), 2);
 
     /* Prepare a stack array for the parameters. We will pass a pointer to
      * this array into our callback function. */
     int argc = To->arg_size() + getGlobalCount(From);
     Value *ParamC = ConstantInt::get(Type::getInt32Ty(Ctx), argc);
     ArrayType *StackArrayT = ArrayType::get(Type::getInt8PtrTy(Ctx), argc);
+    ArrayType *BoolArrayT = ArrayType::get(Type::getInt1Ty(Ctx), argc);
     Value *Params = Builder.CreateAlloca(StackArrayT, Size1, "params");
+    Value *RParams = Builder.CreateAlloca(BoolArrayT, Size1, "rparams");
+
+    // Fill the RParams
+    for (unsigned k=0; k < To->arg_size(); k++) {
+      Value *ArrIdx = ConstantInt::get(Type::getInt32Ty(Ctx), k++);
+      Value *Dest = Builder.CreateGEP(Params, {Idx2, ArrIdx});
+      Value *ToWrite;
+      if(RequiredParams.count(k)) {
+        ToWrite = ConstantInt::get(Type::getInt32Ty(Ctx), 1);
+      } else {
+        ToWrite = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
+      }
+      Builder.CreateStore(Builder.CreateBitCast(ToWrite, StackArrayT->getArrayElementType()), Dest);
+    }
 
     for (Argument &Arg : To->args()) {
       /* Get the appropriate slot in the parameters array and store
@@ -575,11 +595,12 @@ struct InstrumentEndpoint {
       }
     }
 
-    SmallVector<Value *, 3> Args;
+    SmallVector<Value *, 4> Args;
     Args.push_back((PrototypeF) ? PrototypeF
                                 : Builder.CreateGlobalStringPtr(To->getName()));
     Args.push_back(ParamC);
     Args.push_back(Builder.CreateBitCast(Params, Type::getInt8PtrTy(Ctx)));
+    Args.push_back(Builder.CreateBitCast(RParams, Type::getInt8PtrTy(Ctx)));
 
     BasicBlock *JitReady = BasicBlock::Create(Ctx, "polyjit.ready", To);
     BasicBlock *JitNotReady = BasicBlock::Create(Ctx, "polyjit.not.ready", To);
@@ -611,6 +632,7 @@ struct InstrumentEndpoint {
 private:
   Value *PrototypeF;
   Function *FallbackF;
+  std::set<unsigned> RequiredParams;
 };
 
 static inline void collectRegressionTest(const std::string Name,
@@ -661,6 +683,7 @@ using InstrumentingFunctionCloner =
  */
 bool ModuleExtractor::runOnFunction(Function &F) {
   SetVector<Function *> Functions;
+  std::map<Function *, std::set<unsigned> > RequiredParamsByFunction;
   bool Changed = false;
 
   if (F.isDeclaration())
@@ -676,6 +699,8 @@ bool ModuleExtractor::runOnFunction(Function &F) {
   for (const Region *R : SM.regions()) {
     CodeExtractor Extractor(DT, *(R->getNode()), /*AggregateArgs*/ false);
     if (Extractor.isEligible()) {
+      SetVector<Value *> inputs, outputs;
+      Extractor.findInputsOutputs(inputs, outputs);
       if (Function *ExtractedF = Extractor.extractCodeRegion()) {
         ExtractedF->setLinkage(GlobalValue::WeakAnyLinkage);
         ExtractedF->setName(ExtractedF->getName() + ".pjit.scop");
@@ -683,6 +708,34 @@ bool ModuleExtractor::runOnFunction(Function &F) {
 
         Functions.insert(ExtractedF);
         Changed |= true;
+
+        // Convert required params to parameter indices.
+        for(auto ParamExpr : SM.getRequiredParams(R)) {
+          // Extract an LLVM from the param expression.
+          llvm::outs() << "Found required param " << *ParamExpr << "\n";
+          // Right now we'll assume that the SCEV is of the form: 4 * (sext %n to i64)
+          // TODO: handle other kinds of SCEVs if they can appear
+          if(auto MulExp = llvm::dyn_cast<llvm::SCEVMulExpr>(ParamExpr)) {
+            if(auto SExtExpr = llvm::dyn_cast<llvm::SCEVSignExtendExpr>(MulExp->getOperand(1))) {
+              if(auto UParamExpr = llvm::dyn_cast<llvm::SCEVUnknown>(SExtExpr->getOperand())) {
+                llvm::Value *Val = UParamExpr->getValue();
+                llvm::outs() << "Extracted value " << *Val << "\n";
+                // Scan for the value in the param vector.
+                for(unsigned i=0; i < inputs.size(); i++) {
+                  if(inputs[i] == Val) {
+                    RequiredParamsByFunction[&F].insert(i);
+                  }
+                }
+              }
+            }
+          }
+        }
+
+        llvm::outs() << "Required param indices: ";
+        for(auto &i : RequiredParamsByFunction[&F]) {
+          llvm::outs() << i << ", ";
+        }
+        llvm::outs() << "\n";
       }
     }
   }
@@ -724,6 +777,7 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     InstCloner.setSource(ProtoF);
     InstCloner.setPrototype(Prototype);
     InstCloner.setFallback(F);
+    InstCloner.setRequiredParams(RequiredParamsByFunction[F]);
 
     Function *InstF = InstCloner.start(/* RemapCalls */ true);
     InstF->addFnAttr(Attribute::OptimizeNone);

@@ -36,6 +36,10 @@ void ScopMapper::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.setPreservesAll();
 }
 
+std::vector<const llvm::SCEV *> ScopMapper::getRequiredParams( const llvm::Region *R) {
+  return JSD->RequiredParams[R];
+}
+
 bool ScopMapper::runOnFunction(Function &F) {
   JSD = &getAnalysis<polli::JITScopDetection>();
   DTP = &getAnalysis<DominatorTreeWrapperPass>();
