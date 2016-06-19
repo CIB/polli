@@ -244,7 +244,6 @@ static inline Function *getPrototype(const char *function) {
   return F;
 }
 
-#ifdef DEBUG
 static void printArgs(const Function &F, size_t argc, char **params) {
   using fmt::format;
 
@@ -258,7 +257,6 @@ static void printArgs(const Function &F, size_t argc, char **params) {
                      reinterpret_cast<void *>(params[i]));
   }
 }
-#endif
 
 static void printRunValues(const RunValueList &Values) {
   using fmt::format;
@@ -424,6 +422,7 @@ public:
             while (!Work.empty()) {
               const SpecializerRequest &Request = *Work.front();
               Function *F = getPrototype(Request.IR);
+              printArgs(*F, Request.ParamC, Request.Params);
               IRFunctionCache.insert(std::make_pair(Request.IR, F));
 
               RunValueList Values =
@@ -502,11 +501,13 @@ bool pjit_main(const char *fName, unsigned paramc, char **params) {
   bool JitReady = false;
   auto Request = std::make_shared<SpecializerRequest>(fName, paramc, params);
 
+
   JIT.addRequest(Request);
   if (!IRFunctionCache.count(fName)) {
     // We have never seen this prototype, so we block until the first
     // version can be delivered.
     F = IRFunctionCache.blocking_at(fName);
+    printArgs(*F, paramc, params);
     RunValueList Values = runValues(F, paramc, params);
     CacheKey K(Request->IR, Values.hash());
     uint64_t CacheResult = CompileCache.blocking_at(K);
@@ -531,4 +532,4 @@ bool pjit_main(const char *fName, unsigned paramc, char **params) {
 
   return JitReady;
 }
-}
+} // namespace

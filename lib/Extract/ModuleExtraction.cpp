@@ -549,7 +549,6 @@ struct ParametrizeLowerBounds {
 
   }
 };
-
 /**
  * @brief Endpoint policy that instruments the target Function for PolyJIT
  *
@@ -715,22 +714,66 @@ struct InstrumentEndpoint {
     Builder.CreateBr(Exit);
     Builder.SetInsertPoint(JitNotReady);
 
+    // Checkpoint the Fallback Function
+    
+    ValueToValueMapTy VMap2;
+    FunctionCloner<CopyCreator, IgnoreSource, IgnoreTarget> PlainFunctionCloner(VMap2, M);
+    PlainFunctionCloner.setSource(FallbackF);
+    Function *FallbackCopy = PlainFunctionCloner.start();
+    
+    auto loopHeaderO = getLoopHeader(LI, *FallbackF);
+    auto loopHeader = llvm::dyn_cast<BasicBlock>(VMap2[loopHeaderO]);
+    auto loop = LI->getLoopFor(loopHeader);
+    auto phiNodes = findPhiNodes(LI, *loopHeader);
+    
+    // We will insert the checkpoint as an alternative to the loop header.
+    // Scan for the predecessor of the loop header that's within the loop.
+    llvm::BasicBlock *LastBlock;
+    // Assumption: The loop header has a predecessor within the block.
+    for(auto PI = pred_begin(loopHeaderO), E = pred_end(loopHeaderO); PI != E; PI++) {
+      LastBlock = *PI;
+      if(loop->contains(LastBlock)) {
+        break;
+      }
+    }
+
+    LastBlock = dyn_cast<BasicBlock>(VMap2[LastBlock]);
+
+    BasicBlock *CheckJitReady = BasicBlock::Create(Ctx, "polyjit.checkready", FallbackCopy);
+    BasicBlock *OnJitReady = BasicBlock::Create(Ctx, "polyjit.onready", FallbackCopy);
+    IRBuilder<> Builder2(CheckJitReady);
+    Builder2.SetInsertPoint(CheckJitReady);
+    ReadyCheck = Builder.CreateCall(PJITCB, Args);
+
+    Builder2.CreateCondBr(ReadyCheck, OnJitReady, loopHeader);
+
+    // Replace the branch to the loop header with a branch to CheckJitReady
+    auto TerminatorInst = LastBlock->getTerminator();
+    for(unsigned i=0; i < TerminatorInst->getNumSuccessors(); i++) {
+      auto Successor = TerminatorInst->getSuccessor(i);
+      if(Successor == loopHeader) {
+        TerminatorInst->setSuccessor(i, CheckJitReady);
+      }
+    }
+
     // Just hand the args from the function down to the source function.
     SmallVector<Value *, 3> ToArgs;
     for (auto &Arg: To->args()) {
       ToArgs.push_back(&Arg);
     }
-    Builder.CreateCall(FallbackF, ToArgs);
-    Builder.CreateBr(Exit);
-    Builder.SetInsertPoint(Exit);
-    Builder.CreateRetVoid();
+    Builder2.SetInsertPoint(OnJitReady);
+    Builder2.CreateCall(FallbackF, ToArgs);
+    Builder2.CreateRetVoid();
   }
+
+  void setLoopInfo(LoopInfo *V) { LI = V; }
 
 private:
   std::vector<Value*> initialValues;
   Function *PrototypeF;
   Value *PrototypeV;
   Function *FallbackF;
+  LoopInfo *LI;
 };
 
 static inline void collectRegressionTest(const std::string Name,
@@ -850,21 +893,11 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     // tries to detect that again.
     collectRegressionTest(FromName, ModStr);
 
-    // We create a copy of F to use as a fallback function for the
-    // instrumented version of F. The main reason for this is that
-    // later in this function, we will replace all calls to F with
-    // a call to an instrumented version of F, and thus we must
-    // not call F directly from within the instrumented version.
-    ValueToValueMapTy VMap2;
-    FunctionCloner<CopyCreator, IgnoreSource, IgnoreTarget> PlainFunctionCloner(VMap2, M);
-    PlainFunctionCloner.setSource(F);
-    Function *FallbackCopy = PlainFunctionCloner.start();
-
     InstrumentingFunctionCloner InstCloner(VMap, M);
     InstCloner.setInitialValues(ParametrizeCloner.initialValues);
     InstCloner.setSource(F);
     InstCloner.setPrototype(ProtoF, Prototype);
-    InstCloner.setFallback(FallbackCopy);
+    InstCloner.setFallback(F);
 
     Function *InstF = InstCloner.start(/* RemapCalls */ false);
     llvm::outs() << "Original function: " << *F << "\n";
