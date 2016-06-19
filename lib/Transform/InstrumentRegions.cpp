@@ -45,8 +45,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h" // for SplitEdge
 #include "papi.h"                       // for PAPI_VER_CURRENT
 #include "polli/InstrumentRegions.h"    // for PapiCScopProfiling, etc
-#include "polli/JitScopDetection.h"  // for JitScopDetection, etc
-#include "polly/ScopDetection.h"        // for ScopDetection, etc
+#include "polli/ScopDetection.h"        // for ScopDetection, etc
 #include "llvm/Support/Casting.h"       // for isa
 #include "llvm/Support/Debug.h"         // for dbgs, DEBUG
 #include "llvm/Support/raw_ostream.h"   // for raw_ostream, errs
@@ -59,7 +58,6 @@ using namespace polli;
 using namespace polly;
 
 STATISTIC(InstrumentedRegions, "Number of instrumented regions");
-STATISTIC(InstrumentedJITScops, "Number of instrumented JIT SCoPs");
 STATISTIC(MoreEntries, "Number of regions with more than one entry edge");
 STATISTIC(MoreExits, "Number of regions with more than one exit edge");
 
@@ -259,22 +257,12 @@ bool PapiCScopProfilingInit::runOnModule(Module &M) {
  * @return true, if we actually instrumented something.
  */
 bool PapiCScopProfiling::runOnFunction(Function &) {
-  SD = &getAnalysis<ScopDetection>();
-  NSD = getAnalysisIfAvailable<JitScopDetection>();
+  SD = &getAnalysis<polli::JITScopDetection>();
   RI = &getAnalysis<RegionInfoPass>();
 
   for (const auto & elem : *SD) {
     if (processRegion(elem))
       ++InstrumentedRegions;
-  }
-
-  if (NSD) {
-    for (const Region *R : NSD->jitScops()) {
-      if (processRegion(R)) {
-        ++InstrumentedRegions;
-        ++InstrumentedJITScops;
-      }
-    }
   }
 
   return true;
@@ -401,10 +389,10 @@ char PapiCScopProfilingInit::ID = 0;
 INITIALIZE_PASS_BEGIN(PapiCScopProfilingInit, "pprof-init",
                       "PAPI CScop Profiling (Initialization)", false, false);
 INITIALIZE_PASS_END(PapiCScopProfilingInit, "pprof-init",
-                      "PAPI CScop Profiling (Initialization)", false, false);
+                      "PAPI CScop Profiling (Initialization)", false, false)
 
 INITIALIZE_PASS_BEGIN(PapiCScopProfiling, "pprof-caddy", "PAPI CScop Profiling",
                       false, false);
-INITIALIZE_PASS_DEPENDENCY(ScopDetection);
+INITIALIZE_PASS_DEPENDENCY(JITScopDetection);
 INITIALIZE_PASS_END(PapiCScopProfiling, "pprof-caddy",
-                      "PAPI CScop Profiling", false, false);
+                      "PAPI CScop Profiling", false, false)

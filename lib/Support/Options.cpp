@@ -48,7 +48,7 @@ std::string TargetTriple = "";
 std::string MArch = "";
 std::string MCPU = "";
 std::vector<std::string> MAttrs;
-llvm::Reloc::Model RelocModel = Reloc::Default;
+llvm::Reloc::Model RelocModel = Reloc::PIC_;
 llvm::CodeModel::Model CModel = CodeModel::JITDefault;
 llvm::FloatABI::ABIType FloatABIForCalls = FloatABI::Default;
 bool GenerateSoftFloatCalls = false;
@@ -65,19 +65,12 @@ bool EmitEnv = false;
 bool havePapi() {
   return std::getenv("POLLI_ENABLE_PAPI") != nullptr;
 }
-
 /**
  * @brief Check, if we have likwid support at run-time.
  *
  * @return bool
  */
 bool haveLikwid() {
-  if (EmitEnv) {
-    for (char **current = environ; *current; current++) {
-      dbgs() << *current << "\n";
-    }
-  }
-
   return std::getenv("LIKWID_MODE") != nullptr;
 }
 } // namespace opt

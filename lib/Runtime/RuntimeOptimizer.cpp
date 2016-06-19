@@ -17,6 +17,7 @@
 #include "polli/Utils.h"
 #include "polli/LikwidMarker.h"
 #include "polli/Options.h"
+#include "polli/BasePointers.h"
 
 #include "llvm/Analysis/Passes.h"
 #include "llvm/Analysis/RegionInfo.h"
@@ -28,8 +29,10 @@
 #include "llvm/PassAnalysisSupport.h"
 #include "llvm/PassRegistry.h"
 #include "llvm/PassSupport.h"
+#include "llvm/Transforms/IPO.h"
 #include "llvm/Transforms/IPO/PassManagerBuilder.h"
 
+#include "polly/LinkAllPasses.h"
 #include "polly/RegisterPasses.h"
 #include "polly/Options.h"
 
@@ -46,24 +49,16 @@ using namespace polly;
 namespace polli {
 static void registerPolly(const llvm::PassManagerBuilder &Builder,
                           llvm::legacy::PassManagerBase &PM) {
-  polly::registerPollyPasses(PM);
+  PM.add(polly::createScopDetectionPass());
+  PM.add(polly::createScopInfoRegionPassPass());
+  PM.add(polly::createIslScheduleOptimizerPass());
+  PM.add(polly::createCodeGenerationPass());
+  // FIXME: This dummy ModulePass keeps some programs from miscompiling,
+  // probably some not correctly preserved analyses. It acts as a barrier to
+  // force all analysis results to be recomputed.
+  PM.add(createBarrierNoopPass());
 }
 
-#ifdef DEBUG
-static PassManagerBuilder getDebugBuilder() {
-  PassManagerBuilder Builder;
-
-  Builder.VerifyInput = true;
-  Builder.VerifyOutput = true;
-  Builder.OptLevel = 0;
-  Builder.DisableUnrollLoops = true;
-  Builder.DisableTailCalls = true;
-  Builder.addGlobalExtension(PassManagerBuilder::EP_EarlyAsPossible,
-                             registerPolly);
-
-  return Builder;
-}
-#else
 static PassManagerBuilder getBuilder() {
   PassManagerBuilder Builder;
 
@@ -75,43 +70,47 @@ static PassManagerBuilder getBuilder() {
 
   return Builder;
 }
-#endif
 
 Function &OptimizeForRuntime(Function &F) {
-#ifdef DEBUG
-  static PassManagerBuilder Builder = getDebugBuilder();
-#else
   static PassManagerBuilder Builder = getBuilder();
-#endif
   Module *M = F.getParent();
+#ifdef POLLI_STORE_OUTPUT
   opt::GenerateOutput = true;
+#endif
   polly::opt::PollyParallel = true;
 
-  FunctionPassManager PM = FunctionPassManager(M);
+  legacy::FunctionPassManager PM = legacy::FunctionPassManager(M);
 
   Builder.populateFunctionPassManager(PM);
+#ifdef POLLI_ENABLE_BASE_POINTERS
+  PM.add(polli::createBasePointersPass());
+#endif
   PM.doInitialization();
   PM.run(F);
   PM.doFinalization();
 
+#ifdef POLLI_ENABLE_PAPI
   if (opt::havePapi()) {
-    PassManager MPM;
+    legacy::PassManager MPM;
     Builder.populateModulePassManager(MPM);
     MPM.add(polli::createTraceMarkerPass());
     MPM.run(*M);
   }
+#endif
 
+#ifdef POLLI_ENABLE_LIKWID
   if (opt::haveLikwid()) {
-    PassManager MPM;
+    legacy::PassManager MPM;
     Builder.populateModulePassManager(MPM);
     MPM.add(polli::createLikwidMarkerPass());
     MPM.run(*M);
   }
+#endif
 
-  DEBUG(
-  StoreModule(*M, M->getModuleIdentifier() + ".after.polly.ll")
-  );
+#ifdef POLLI_STORE_OUTPUT
+  DEBUG(StoreModule(*M, M->getModuleIdentifier() + ".after.polly.ll"));
   opt::GenerateOutput = false;
+#endif
 
   return F;
 }
