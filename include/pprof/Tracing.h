@@ -1,6 +1,7 @@
 #ifndef PPROF_TRACING_H
 #define PPROF_TRACING_H
 
+#include "string.h"
 #include "pprof/pprof.h"
 #include "pprof/Config.h"
 #include "polli/Options.h"
