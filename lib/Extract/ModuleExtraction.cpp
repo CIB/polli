@@ -48,6 +48,7 @@ void ModuleExtractor::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<CallGraphWrapperPass>();
   AU.addRequired<DominatorTreeWrapperPass>();
   AU.addRequired<ScalarEvolutionWrapperPass>();
+  AU.addRequired<LoopInfoWrapperPass>();
 }
 
 void ModuleExtractor::releaseMemory() { InstrumentedFunctions.clear(); }
@@ -312,6 +313,7 @@ struct AddGlobalsPolicy {
    */
   Function *Create(Function *From, Module *To) {
     GlobalList ReqGlobals = getGVsUsedInFunction(*From);
+    console->error("ReqGlobals size: {:d}", ReqGlobals.size());
     ArgListT Args;
 
     for (auto &Arg : From->args())
@@ -431,6 +433,117 @@ static Function *extractPrototypeM(ValueToValueMapTy &VMap, Function &F,
   return Proto;
 }
 
+std::vector<PHINode*> findPhiNodes(LoopInfo* LI, BasicBlock& BB) {
+  std::vector<PHINode*> RetVal;
+  for(Instruction &I : BB) {
+    if(auto Phi = dyn_cast<PHINode>(&I)) {
+      RetVal.push_back(Phi);
+    }
+  }
+  return RetVal;
+}
+
+BasicBlock* getLoopHeader(LoopInfo *LI, Function &F) {
+  // We scan for the header of the outermost loop in the function.
+  // There should only be one outermost loop in the SCoP function.
+  for(auto& BB : F) {
+    if(LI->isLoopHeader(&BB)) {
+      auto ContainerLoop = LI->getLoopFor(&BB);
+      if(ContainerLoop->getLoopDepth() == 1) {
+        return &BB;
+      }
+    }
+  }
+
+  // TODO: put an unreachable here
+  return NULL;
+}
+
+/**
+ * @brief Parametrize lower bounds of function.
+ */
+struct AddLowerBoundsParametersPolicy {
+private:
+  LoopInfo *LI;
+
+public:
+  void MapArguments(ValueToValueMapTy &VMap, Function *From,
+                    Function *To) {
+    Function::arg_iterator NewArg = To->arg_begin();
+    for (Argument &Arg : From->args()) {
+      NewArg->setName(Arg.getName());
+      VMap[&Arg] = &*(NewArg++);
+    }
+
+  }
+
+  Function *Create(Function *From, Module *To) {
+    BasicBlock *loopHeader = getLoopHeader(LI, *From);
+    std::vector<PHINode*> phiNodes = findPhiNodes(LI, *loopHeader);
+    ArgListT Args;
+
+    for (auto &Arg : From->args())
+      Args.push_back(Arg.getType());
+
+    for (const PHINode *PV : phiNodes)
+      Args.push_back(PV->getType());
+
+    FunctionType *FType = FunctionType::get(From->getReturnType(), Args, false);
+    Function *F =
+      Function::Create(FType, From->getLinkage(), From->getName(), To);
+
+    return F;
+  }
+
+  void setLoopInfo(LoopInfo *LI) { this->LI = LI; }
+};
+
+
+/**
+ * @brief Replace the lower bounds of the loop with parameters.
+ */
+struct ParametrizeLowerBounds {
+private:
+  LoopInfo *LI1;
+public:
+  std::vector<Value*> initialValues;
+  void setLoopInfo1(LoopInfo *LI) { LI1 = LI; }
+  void Apply(Function *From, Function *To, ValueToValueMapTy &VMap) {
+    assert(From && "No source function!");
+    assert(To && "No target function!");
+
+    if (To->isDeclaration())
+      return;
+
+    llvm::outs() << "To function: " << *To << "\n";
+
+    auto loopHeader = getLoopHeader(LI1, *From);
+    auto loop = LI1->getLoopFor(loopHeader);
+    auto phiNodes = findPhiNodes(LI1, *loopHeader);
+
+    // First skip the parameters that already exist in the source function.
+    Function::arg_iterator NewArg = To->arg_begin();
+    for (Argument &Arg : From->args()) {
+      NewArg++;
+    }
+
+    // Now replace the lower bound of each phi node with the remaining arguments.
+    for (auto phiNode : phiNodes) {
+      for(unsigned int i=0; i < phiNode->getNumIncomingValues(); i++) {
+        if(!loop->contains(phiNode->getIncomingBlock(i))) {
+          // Remember the original incoming value in initialValues
+          initialValues.push_back(phiNode->getIncomingValue(i));
+          auto phiNodeInTarget = dyn_cast<PHINode>(VMap[phiNode]);
+          phiNodeInTarget->setIncomingValue(i, &*NewArg);
+          break;
+        }
+      }
+      NewArg++;
+    }
+
+  }
+};
+
 /**
  * @brief Endpoint policy that instruments the target Function for PolyJIT
  *
@@ -447,7 +560,7 @@ struct InstrumentEndpoint {
    * @param Prototype A prototype value that gets passed to the JIT as string.
    * @return void
    */
-  void setPrototype(Value *Prototype) { PrototypeF = Prototype; }
+  void setPrototype(Function *PrototypeFunction, Value *PrototypeValue) { PrototypeF = PrototypeFunction; PrototypeV = PrototypeValue; }
 
   /**
    * @brief Setter for a fallback function that will be called.
@@ -461,6 +574,8 @@ struct InstrumentEndpoint {
    * @param F The function we use as fallback when the JIT is not ready.
    */
   void setFallback(Function *F) { FallbackF = F; }
+
+  void setInitialValues(std::vector<Value*> IV) { initialValues = IV; }
 
   /**
    * @brief Apply the JIT indirection to the target Function.
@@ -528,8 +643,10 @@ struct InstrumentEndpoint {
     Value *Idx0 = ConstantInt::get(Type::getInt32Ty(Ctx), 0);
 
     /* Prepare a stack array for the parameters. We will pass a pointer to
-     * this array into our callback function. */
-    int argc = To->arg_size() + getGlobalCount(From);
+     * this array into our callback function. */;
+    llvm::outs() << "From: " << *From << "\n";
+    console->error("argc: To->arg_size() {:d} initialValues.size() {:d} getGlobalCount(From) {:d}", To->arg_size(), initialValues.size(), getGlobalCount(From));
+    int argc = To->arg_size() + initialValues.size() + getGlobalCount(PrototypeF);
     Value *ParamC = ConstantInt::get(Type::getInt32Ty(Ctx), argc);
     ArrayType *StackArrayT = ArrayType::get(Type::getInt8PtrTy(Ctx), argc);
     Value *Params = Builder.CreateAlloca(StackArrayT, Size1, "params");
@@ -555,9 +672,25 @@ struct InstrumentEndpoint {
     }
 
     // Append required global variables.
-    Function::arg_iterator GlobalArgs = From->arg_begin();
+    Function::arg_iterator GlobalArgs = PrototypeF->arg_begin();
     for (int j = 0; j < i; j++)
       GlobalArgs++;
+    // Append lower bounds.
+    for (auto LowerBound : initialValues) {
+      Value *Slot;
+      Slot = Builder.CreateAlloca(LowerBound->getType(), Size1);
+      llvm::errs() << "LowerBound" << *LowerBound << "\n";
+      llvm::errs() << "Slow Type:" << *Slot << "\n";
+      Builder.CreateStore(LowerBound, Slot, "pjit.stack.param_lowerbound");
+      Value *ArrIdx = ConstantInt::get(Type::getInt32Ty(Ctx), i++);
+      Value *Dest = Builder.CreateGEP(Params, {Idx0, ArrIdx});
+      Builder.CreateStore(Builder.CreateBitCast(Slot, StackArrayT->getArrayElementType()), Dest);
+      GlobalArgs++;
+    }
+
+    console->error("Done with initialvalues");
+
+    // Append required global variables.
     for (; i < argc; i++) {
       StringRef Name = (GlobalArgs++)->getName();
       if (GlobalVariable *GV =
@@ -578,7 +711,7 @@ struct InstrumentEndpoint {
     Value *CastParams = Builder.CreateBitCast(Params, Type::getInt8PtrTy(Ctx));
 
     SmallVector<Value *, 4> Args;
-    Args.push_back((PrototypeF) ? PrototypeF
+    Args.push_back((PrototypeV) ? PrototypeV
                                 : Builder.CreateGlobalStringPtr(To->getName()));
     Args.push_back(PrefixData);
     Args.push_back(ParamC);
@@ -603,6 +736,7 @@ struct InstrumentEndpoint {
     // We need to replace all uses of our fallback function with the new
     // instrumented version _before_ we create the call to the fallback
     // function, otherwise we would call ourselves until the jit is ready.
+    llvm::outs() << "FallbackF " << *FallbackF->getType() << " To " << *To->getType() << "\n";
     FallbackF->replaceAllUsesWith(To);
 
     Value *False = ConstantInt::getFalse(Ctx);
@@ -615,9 +749,14 @@ struct InstrumentEndpoint {
     Builder.CreateRetVoid();
   }
 
+  void setLoopInfo(LoopInfo *V) { LI = V; }
+
 private:
-  Value *PrototypeF;
+  std::vector<Value*> initialValues;
+  Function *PrototypeF;
+  Value *PrototypeV;
   Function *FallbackF;
+  LoopInfo *LI;
 };
 
 static inline void collectRegressionTest(const std::string Name,
@@ -728,7 +867,7 @@ struct SCEVParamValueExtractor
 };
 
 using InstrumentingFunctionCloner =
-    FunctionCloner<RemoveGlobalsPolicy, IgnoreSource, InstrumentEndpoint>;
+    FunctionCloner<CopyCreator, IgnoreSource, InstrumentEndpoint>;
 
 static CallSite findExtractedCallSite(Function &F, Function &SrcF) {
   for (auto &Inst : instructions(&SrcF)) {
@@ -878,6 +1017,7 @@ bool ModuleExtractor::runOnFunction(Function &F) {
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   JITScopDetection &SD = getAnalysis<JITScopDetection>();
   ScalarEvolution &SE = getAnalysis<ScalarEvolutionWrapperPass>().getSE();
+  this->LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
 
   Functions = extractCandidates(F, SD, SE, DT);
   if (Functions.size() > 0)
@@ -889,15 +1029,25 @@ bool ModuleExtractor::runOnFunction(Function &F) {
       continue;
     console->info("Extracting: {:s}", F->getName().str());
 
-    ValueToValueMapTy VMap;
     Module *M = F->getParent();
+    ValueToValueMapTy VMap3;
+    FunctionCloner<AddLowerBoundsParametersPolicy, IgnoreSource, ParametrizeLowerBounds> ParametrizeCloner(VMap3, M);
+    ParametrizeCloner.setSource(F);
+    ParametrizeCloner.setLoopInfo(LI);
+    ParametrizeCloner.setLoopInfo1(LI);
+    auto ParametrizedF = ParametrizeCloner.start();
+    llvm::outs() << "After parametrization: " << *ParametrizedF << "\n";
+
+    ValueToValueMapTy VMap;
+
     StringRef ModuleName = F->getParent()->getModuleIdentifier();
     StringRef FromName = F->getName();
     ModulePtrT PrototypeM = copyModule(VMap, *M);
 
     PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
                                     ".prototype");
-    Function *ProtoF = extractPrototypeM(VMap, *F, *PrototypeM);
+    Function *ProtoF = extractPrototypeM(VMap, *ParametrizedF, *PrototypeM);
+    llvm::outs() << "ProtoF: " << *ProtoF << "\n";
 
     llvm::legacy::PassManager MPM;
     MPM.add(llvm::createStripSymbolsPass(true));
@@ -918,11 +1068,14 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     collectRegressionTest(FromName, ModStr);
 
     InstrumentingFunctionCloner InstCloner(VMap, M);
-    InstCloner.setSource(ProtoF);
-    InstCloner.setPrototype(Prototype);
+    InstCloner.setInitialValues(ParametrizeCloner.initialValues);
+    InstCloner.setSource(F);
+    InstCloner.setPrototype(ProtoF, Prototype);
     InstCloner.setFallback(F);
 
-    Function *InstF = InstCloner.start(/* RemapCalls */ true);
+    Function *InstF = InstCloner.start(/* RemapCalls */ false);
+    llvm::outs() << "Original function: " << *F << "\n";
+    llvm::outs() << "Instrumented function: " << *InstF << "\n";
     InstF->addFnAttr(Attribute::OptimizeNone);
     InstF->addFnAttr(Attribute::NoInline);
 

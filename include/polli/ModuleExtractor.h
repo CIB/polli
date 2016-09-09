@@ -16,6 +16,7 @@
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Function.h"
 #include "llvm/Pass.h"
+#include "llvm/Analysis/LoopInfo.h"
 
 namespace polli {
 class ModuleExtractor : public llvm::FunctionPass {
@@ -31,6 +32,7 @@ public:
   virtual void print(llvm::raw_ostream &, const llvm::Module *) const override;
   //@}
 private:
+  LoopInfo *LI;
   llvm::SetVector<llvm::Function *> InstrumentedFunctions;
   //===--------------------------------------------------------------------===//
   // DO NOT IMPLEMENT
