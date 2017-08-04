@@ -1,4 +1,3 @@
-//===-- libpjit.cpp - PolyJIT Just in Time Compiler -----------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -100,6 +99,7 @@ static void DoCreateVariant(const SpecializerRequest Request, CacheKey K) {
   auto CacheIt = JitContext->insert(std::make_pair(K, std::move(FPtr)));
   if (!CacheIt.second)
     llvm_unreachable("Key collision in function cace, abort.");
+  JitContext->CheckpointPtr[K] = (void*) *Addr;
   DEBUG(printRunValues(Values));
 }
 
@@ -128,7 +128,7 @@ void pjit_trace_fnstats_exit(uint64_t Id) {
  * @param paramc number of arguments of the function we want to call
  * @param params arugments of the function we want to call.
  */
-void *pjit_main(const char *fName, void *ptr, uint64_t ID,
+void *pjit_main(const char *fName, uint64_t ID,
                 unsigned paramc, char **params) {
   JitContext->enter(JitRegion::CODEGEN, papi::PAPI_get_real_usec());
 
@@ -142,6 +142,11 @@ void *pjit_main(const char *fName, void *ptr, uint64_t ID,
     JitContext->addRegion(F.getName().str(), ID);
 
   CacheKey K{ID, Values.hash()};
+  if (JitContext->CheckpointPtr.find(K) == JitContext->CheckpointPtr.end()) {
+    JitContext->CheckpointPtr.insert(std::make_pair(K, nullptr));
+  }
+  //console->debug("pjit_main: ID: {:d} Hash: {:d} Values {:s}", ID, K.ValueHash,
+  //               Values.str());
   auto FutureFn =
       JitContext->async(GetOrCreateVariantFunction, Request, ID, K);
 
