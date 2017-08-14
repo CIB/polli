@@ -255,10 +255,9 @@ struct InstrumentEndpoint {
     assert((JitID != 0) && "Invalid JIT Id.");
     Constant *JitIDVal = ConstantInt::get(Int64T, JitID, false);
 
-    SmallVector<Value *, 4> Args;
+    SmallVector<Value *, 3> Args;
     Args.push_back((PrototypeF) ? PrototypeF
                                 : Builder.CreateGlobalStringPtr(To->getName()));
-    Args.push_back(PtrToOriginalF);
     Args.push_back(JitIDVal);
     Args.push_back(ParamC);
     Args.push_back(CastParams);
@@ -269,12 +268,44 @@ struct InstrumentEndpoint {
       ToArgs.push_back(&Arg);
     }
 
+    // Ret is a pointer to a function pointer here, cast accordingly
     auto Ret = Builder.CreateCall(PJITCB, Args);
+    auto RetCasted = Builder.CreateBitCast(Ret, FallbackF->getType()->getPointerTo());
+
+    // Unpack Ret
+    auto CalledFunctionPointer = Builder.CreateLoad(RetCasted);
+    auto Cond = Builder.CreateBitCast(CalledFunctionPointer, Type::getInt1Ty(Ctx));
+
+    // Generate blocks for each of the cases we're going to handle.
+    BasicBlock *FallbackBlock = BasicBlock::Create(Ctx, "polyjit.fallback", To);
+    BasicBlock *OptimizedBlock = BasicBlock::Create(Ctx, "polyjit.optimized", To);
+    BasicBlock *ExitBlock = BasicBlock::Create(Ctx, "polyjit.exit", To);
+
+    // Check if the function we're trying to call exists yet.
+    Builder.CreateCondBr(Cond, OptimizedBlock, FallbackBlock);
+
+    Builder.SetInsertPoint(OptimizedBlock);
 
     Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
-    Builder.CreateCall(Builder.CreateBitCast(Ret, FallbackF->getType()),
+    // Call the optimized version of the function that was read from
+    // PJITCB's return value.
+    Builder.CreateCall(CalledFunctionPointer,
                        ToArgs);
     Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
+    Builder.CreateBr(ExitBlock);
+
+    Builder.SetInsertPoint(FallbackBlock);
+
+    Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
+    // Call the original fallback function unmodified.
+    // TODO: modify the fallback function with checkpointing
+    // and pass a pointer to the checkpoint condition
+    Builder.CreateCall(Builder.CreateBitCast(PtrToOriginalF, FallbackF->getType()),
+                       ToArgs);
+    Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
+    Builder.CreateBr(ExitBlock);
+
+    Builder.SetInsertPoint(ExitBlock);
     Builder.CreateRetVoid();
   }
 

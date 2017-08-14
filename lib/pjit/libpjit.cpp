@@ -142,28 +142,18 @@ void *pjit_main(const char *fName, uint64_t ID,
     JitContext->addRegion(F.getName().str(), ID);
 
   CacheKey K{ID, Values.hash()};
-  if (JitContext->CheckpointPtr.find(K) == JitContext->CheckpointPtr.end()) {
-    JitContext->CheckpointPtr.insert(std::make_pair(K, nullptr));
+  auto FnIt = JitContext->CheckpointPtr.find(K);
+  if (FnIt == JitContext->CheckpointPtr.end()) {
+    FnIt = JitContext->CheckpointPtr.insert(std::make_pair(K, nullptr)).first;
   }
   //console->debug("pjit_main: ID: {:d} Hash: {:d} Values {:s}", ID, K.ValueHash,
   //               Values.str());
   auto FutureFn =
       JitContext->async(GetOrCreateVariantFunction, Request, ID, K);
 
-  // If it was not a cache-hit, wait until the first variant is ready.
-  if (!CacheHit)
-    FutureFn.wait();
-
   JitContext->exit(JitRegion::CODEGEN, papi::PAPI_get_real_usec());
 
-  auto FnIt = JitContext->find(K);
-  if (FnIt != JitContext->end()) {
-    auto &Symbol = FnIt->second;
-    auto Addr = Symbol.getAddress();
-    if (Addr)
-      return (void *)*Addr;
-  }
-  return ptr;
+  return (void*) (&(FnIt->second));
 }
 
 /**
