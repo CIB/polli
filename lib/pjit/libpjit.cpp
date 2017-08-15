@@ -99,7 +99,7 @@ static void DoCreateVariant(const SpecializerRequest Request, CacheKey K) {
   auto CacheIt = JitContext->insert(std::make_pair(K, std::move(FPtr)));
   if (!CacheIt.second)
     llvm_unreachable("Key collision in function cace, abort.");
-  JitContext->CheckpointPtr[K] = (void*) *Addr;
+  *(JitContext->CheckpointPtr[K]) = (void*) *Addr;
   DEBUG(printRunValues(Values));
 }
 
@@ -125,10 +125,12 @@ void pjit_trace_fnstats_exit(uint64_t Id) {
  * All calls to the PolyJIT runtime will land here.
  *
  * @param fName The function name we want to call.
+ * @retFunctionPtr The optimized version of the function will be placed here once completed.
+ *                 Until then, the value will be initialized to 0.
  * @param paramc number of arguments of the function we want to call
  * @param params arugments of the function we want to call.
  */
-void *pjit_main(const char *fName, uint64_t ID,
+void pjit_main(const char *fName, void **retFunctionPtr, uint64_t ID,
                 unsigned paramc, char **params) {
   JitContext->enter(JitRegion::CODEGEN, papi::PAPI_get_real_usec());
 
@@ -142,18 +144,21 @@ void *pjit_main(const char *fName, uint64_t ID,
     JitContext->addRegion(F.getName().str(), ID);
 
   CacheKey K{ID, Values.hash()};
-  auto FnIt = JitContext->CheckpointPtr.find(K);
-  if (FnIt == JitContext->CheckpointPtr.end()) {
-    FnIt = JitContext->CheckpointPtr.insert(std::make_pair(K, nullptr)).first;
+  auto CacheResult = JitContext->CheckpointPtr.find(K);
+  if (CacheResult == JitContext->CheckpointPtr.end()) {
+    JitContext->CheckpointPtr.insert(std::make_pair(K, retFunctionPtr)).first;
+    *retFunctionPtr = 0;
+    auto FutureFn =
+      JitContext->async(GetOrCreateVariantFunction, Request, ID, K);
+  } else {
+    *retFunctionPtr = CacheResult->second;
   }
   //console->debug("pjit_main: ID: {:d} Hash: {:d} Values {:s}", ID, K.ValueHash,
   //               Values.str());
-  auto FutureFn =
-      JitContext->async(GetOrCreateVariantFunction, Request, ID, K);
 
   JitContext->exit(JitRegion::CODEGEN, papi::PAPI_get_real_usec());
 
-  return (void*) (&(FnIt->second));
+  return;
 }
 
 /**

@@ -185,7 +185,7 @@ struct InstrumentEndpoint {
     Type *Int32T = Type::getInt32Ty(Ctx);
 
     Function *PJITCB = cast<Function>(M->getOrInsertFunction(
-        CallbackName, VoidPtr,
+        CallbackName, Void,
         CharPtr, VoidPtr, Int64T, Int32T, CharPtr));
     PJITCB->setLinkage(GlobalValue::ExternalLinkage);
 
@@ -255,9 +255,14 @@ struct InstrumentEndpoint {
     assert((JitID != 0) && "Invalid JIT Id.");
     Constant *JitIDVal = ConstantInt::get(Int64T, JitID, false);
 
-    SmallVector<Value *, 3> Args;
+    // Create space on the stack where the JIT will put a pointer to the optimized version of the function.
+    auto CalledFunctionPointerSlot = Builder.CreateAlloca(FallbackF->getType(), Size1, "pjit.stack.optimized_function");
+    
+
+    SmallVector<Value *, 4> Args;
     Args.push_back((PrototypeF) ? PrototypeF
                                 : Builder.CreateGlobalStringPtr(To->getName()));
+    Args.push_back(CalledFunctionPointerSlot);
     Args.push_back(JitIDVal);
     Args.push_back(ParamC);
     Args.push_back(CastParams);
@@ -268,12 +273,10 @@ struct InstrumentEndpoint {
       ToArgs.push_back(&Arg);
     }
 
-    // Ret is a pointer to a function pointer here, cast accordingly
-    auto Ret = Builder.CreateCall(PJITCB, Args);
-    auto RetCasted = Builder.CreateBitCast(Ret, FallbackF->getType()->getPointerTo());
+    Builder.CreateCall(PJITCB, Args);
 
-    // Unpack Ret
-    auto CalledFunctionPointer = Builder.CreateLoad(RetCasted);
+    // Load the result from the stack.
+    auto CalledFunctionPointer = Builder.CreateLoad(CalledFunctionPointerSlot);
     auto Cond = Builder.CreateBitCast(CalledFunctionPointer, Type::getInt1Ty(Ctx));
 
     // Generate blocks for each of the cases we're going to handle.
