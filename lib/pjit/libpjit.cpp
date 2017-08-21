@@ -99,7 +99,9 @@ static void DoCreateVariant(const SpecializerRequest Request, CacheKey K) {
   auto CacheIt = JitContext->insert(std::make_pair(K, std::move(FPtr)));
   if (!CacheIt.second)
     llvm_unreachable("Key collision in function cace, abort.");
-  *(JitContext->CheckpointPtr[K]) = (void*) *Addr;
+  if (JitContext->CheckpointPtr.find(K) != JitContext->CheckpointPtr.end()) {
+    *(JitContext->CheckpointPtr[K]) = (void*) *Addr;
+  }
   DEBUG(printRunValues(Values));
 }
 
@@ -144,6 +146,13 @@ void pjit_main(const char *fName, void **retFunctionPtr, uint64_t ID,
     JitContext->addRegion(F.getName().str(), ID);
 
   CacheKey K{ID, Values.hash()};
+  
+  if (retFunctionPtr == nullptr) {
+    // This is a special value to signify that the existing stack pointer should be cleared.
+    JitContext->CheckpointPtr.erase(K);
+    return;
+  }
+
   auto CacheResult = JitContext->CheckpointPtr.find(K);
   if (CacheResult == JitContext->CheckpointPtr.end()) {
     JitContext->CheckpointPtr.insert(std::make_pair(K, retFunctionPtr)).first;

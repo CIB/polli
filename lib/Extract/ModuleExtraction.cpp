@@ -306,6 +306,12 @@ struct InstrumentEndpoint {
     Builder.CreateCall(Builder.CreateBitCast(PtrToOriginalF, FallbackF->getType()),
                        ToArgs);
     Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
+
+    // Once the fallback function is done, we need to alert the PJIT that the
+    // stack pointer we passed is no longer valid.
+    Args[1] = Idx0;
+    Builder.CreateCall(PJITCB, Args);
+
     Builder.CreateBr(ExitBlock);
 
     Builder.SetInsertPoint(ExitBlock);
