@@ -1,4 +1,3 @@
-//===-- libpjit.cpp - PolyJIT Just in Time Compiler -----------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -123,6 +122,9 @@ static void DoCreateVariant(const SpecializerRequest Request, CacheKey K) {
       inserted) {
     llvm_unreachable("Key collision in function cace, abort.");
   }
+  if (JitContext->CheckpointPtr.find(K) != JitContext->CheckpointPtr.end()) {
+    *(JitContext->CheckpointPtr[K]) = (void*) *Addr;
+  }
   DEBUG(printRunValues(Values));
 }
 
@@ -148,10 +150,12 @@ void pjit_trace_fnstats_exit(uint64_t Id) {
  * All calls to the PolyJIT runtime will land here.
  *
  * @param fName The function name we want to call.
+ * @retFunctionPtr The optimized version of the function will be placed here once completed.
+ *                 Until then, the value will be initialized to 0.
  * @param paramc number of arguments of the function we want to call
  * @param params arugments of the function we want to call.
  */
-void *pjit_main(const char *fName, void *ptr, uint64_t ID,
+void pjit_main(const char *fName, void **retFunctionPtr, uint64_t ID,
                 unsigned paramc, char **params) {
   // 1. JitContext.
   pjit_trace_fnstats_entry(JitRegion::CODEGEN);
@@ -167,23 +171,25 @@ void *pjit_main(const char *fName, void *ptr, uint64_t ID,
   }
 
   CacheKey K{ID, runValues(Request).hash()};
-  // 3. ThreadPool
-  auto FutureFn = Pool->async(GetOrCreateVariantFunction, Request, ID, K);
 
-  // If it was not a cache-hit, wait until the first variant is ready.
-  if (!CacheHit) {
-    FutureFn.wait();
+  if (retFunctionPtr == nullptr) {
+    // This is a special value to signify that the existing stack pointer should be cleared.
+    JitContext->CheckpointPtr.erase(K);
+    return;
   }
 
+  auto CacheResult = JitContext->CheckpointPtr.find(K);
+  if (CacheResult == JitContext->CheckpointPtr.end()) {
+    JitContext->CheckpointPtr.insert(std::make_pair(K, retFunctionPtr)).first;
+    *retFunctionPtr = 0;
+    auto FutureFn =
+      Pool->async(GetOrCreateVariantFunction, Request, ID, K);
+  } else {
+    *retFunctionPtr = CacheResult->second;
+  }
   pjit_trace_fnstats_exit(JitRegion::CODEGEN);
 
-  if (auto FnIt = JitContext->find(K); FnIt != JitContext->end()) {
-    auto &Symbol = FnIt->second;
-    if (auto Addr = Symbol.getAddress(); Addr) {
-      return reinterpret_cast<void *>(*Addr);
-    }
-  }
-  return ptr;
+  return;
 }
 
 /**

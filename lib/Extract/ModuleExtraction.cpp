@@ -126,6 +126,10 @@ static Function *extractPrototypeM(ValueToValueMapTy &VMap, Function &F,
  */
 struct InstrumentEndpoint {
 
+  void setLoopInfo(LoopInfo *LI) {
+    this->LI = LI;
+  }
+
   /**
    * @brief The prototype function we pass into the JIT callback.
    *
@@ -168,6 +172,8 @@ struct InstrumentEndpoint {
     assert(To && "No target function!");
     assert(FallbackF && "No fallback function!");
 
+    To->removeFnAttr("polyjit-jit-candidate");
+
     if (To->isDeclaration())
       return;
 
@@ -186,7 +192,7 @@ struct InstrumentEndpoint {
     Type *Int32T = Type::getInt32Ty(Ctx);
 
     Function *PJITCB = cast<Function>(M->getOrInsertFunction(
-        CallbackName, VoidPtr,
+        CallbackName, Void,
         CharPtr, VoidPtr, Int64T, Int32T, CharPtr));
     PJITCB->setLinkage(GlobalValue::ExternalLinkage);
 
@@ -255,10 +261,14 @@ struct InstrumentEndpoint {
     assert((JitID != 0) && "Invalid JIT Id.");
     Constant *JitIDVal = ConstantInt::get(Int64T, JitID, false);
 
+    // Create space on the stack where the JIT will put a pointer to the optimized version of the function.
+    auto CalledFunctionPointerSlot = Builder.CreateAlloca(FallbackF->getType(), Size1, "pjit.stack.optimized_function");
+    
+
     SmallVector<Value *, 4> Args;
     Args.push_back((PrototypeF) ? PrototypeF
                                 : Builder.CreateGlobalStringPtr(To->getName()));
-    Args.push_back(PtrToOriginalF);
+    Args.push_back(CalledFunctionPointerSlot);
     Args.push_back(JitIDVal);
     Args.push_back(ParamC);
     Args.push_back(CastParams);
@@ -269,16 +279,58 @@ struct InstrumentEndpoint {
       ToArgs.push_back(&Arg);
     }
 
-    auto Ret = Builder.CreateCall(PJITCB, Args);
+    Builder.CreateCall(PJITCB, Args);
+
+    // Load the result from the stack.
+    auto CalledFunctionPointer = Builder.CreateLoad(CalledFunctionPointerSlot);
+    auto Cond = Builder.CreateBitCast(CalledFunctionPointer, Type::getInt1Ty(Ctx));
+
+    // Generate blocks for each of the cases we're going to handle.
+    BasicBlock *FallbackBlock = BasicBlock::Create(Ctx, "polyjit.fallback", To);
+    BasicBlock *OptimizedBlock = BasicBlock::Create(Ctx, "polyjit.optimized", To);
+    BasicBlock *ExitBlock = BasicBlock::Create(Ctx, "polyjit.exit", To);
+
+    // Check if the function we're trying to call exists yet.
+    Builder.CreateCondBr(Cond, OptimizedBlock, FallbackBlock);
+
+    Builder.SetInsertPoint(OptimizedBlock);
 
     Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
-    Builder.CreateCall(Builder.CreateBitCast(Ret, FallbackF->getType()),
+    // Call the optimized version of the function that was read from
+    // PJITCB's return value.
+    Builder.CreateCall(CalledFunctionPointer,
                        ToArgs);
     Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
+    Builder.CreateBr(ExitBlock);
+
+    Builder.SetInsertPoint(FallbackBlock);
+
+    Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
+    // Call the original fallback function unmodified.
+    // TODO: modify the fallback function with checkpointing
+    // and pass a pointer to the checkpoint condition
+
+    // Scan for loop header
+    auto Loop = LI->getLoopsInPreorder()[0];
+    llvm::outs() << "Loop: " << *(Loop->getHeader()) << "\n";
+
+    Builder.CreateCall(Builder.CreateBitCast(PtrToOriginalF, FallbackF->getType()),
+                       ToArgs);
+    Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
+
+    // Once the fallback function is done, we need to alert the PJIT that the
+    // stack pointer we passed is no longer valid.
+    Args[1] = Idx0;
+    Builder.CreateCall(PJITCB, Args);
+
+    Builder.CreateBr(ExitBlock);
+
+    Builder.SetInsertPoint(ExitBlock);
     Builder.CreateRetVoid();
   }
 
 private:
+  LoopInfo *LI;
   Value *PrototypeF;
   Function *FallbackF;
 };
@@ -679,6 +731,7 @@ void ModuleExtractor::print(raw_ostream &os, const Module *M) const {
 void ModuleInstrumentation::getAnalysisUsage(AnalysisUsage &AU) const {
   AU.addRequired<ModuleExtractor>();
   AU.addRequired<DominatorTreeWrapperPass>();
+  AU.addRequired<LoopInfoWrapperPass>();
 }
 
 void ModuleInstrumentation::releaseMemory() { InstrumentedFunctions.clear(); }
@@ -693,67 +746,66 @@ void ModuleInstrumentation::print(raw_ostream &os, const Module *M) const {
 }
 
 bool ModuleInstrumentation::runOnFunction(Function &F) {
-  ModuleExtractor &ME = getAnalysis<ModuleExtractor>();
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+  this->LI = &getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
+  llvm::outs() << "Function name: " << F.getName() << "\n";
+  llvm::outs() << "Number of loops in function: " << this->LI->getLoopsInPreorder().size() << "\n";
 
   if (F.isDeclaration())
     return false;
-  if (F.hasFnAttribute("polyjit-jit-candidate"))
+  if (!F.hasFnAttribute("polyjit-jit-candidate"))
     return false;
 
-  for (auto *ExtractedFromF : ME) {
-    if (ExtractedFromF->isDeclaration())
-      continue;
-    console->info("Instrumenting: {:s}", ExtractedFromF->getName().str());
+  console->info("Instrumenting: {:s}", F.getName().str());
 
-    ValueToValueMapTy VMap;
-    Module *M = ExtractedFromF->getParent();
-    StringRef ModuleName = ExtractedFromF->getParent()->getModuleIdentifier();
-    StringRef FromName = ExtractedFromF->getName();
-    UniqueModule PrototypeM = copyModule(*M);
+  ValueToValueMapTy VMap;
+  Module *M = F.getParent();
+  StringRef ModuleName = F.getParent()->getModuleIdentifier();
+  StringRef FromName = F.getName();
+  UniqueModule PrototypeM = copyModule(*M);
 
-    PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
+  PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
                                     ".prototype");
-    Function *ProtoF = extractPrototypeM(VMap, *ExtractedFromF, *PrototypeM);
+  Function *ProtoF = extractPrototypeM(VMap, F, *PrototypeM);
 
-    llvm::stripDebugInfo(*ExtractedFromF);
-    llvm::StripDebugInfo(*PrototypeM);
-    //if (verifyModule(*PrototypeM, &errs(), &BrokenDbg)) {
-    //  // We failed verification, skip this region.
-    //  std::string Buf;
-    //  llvm::raw_string_ostream Os(Buf);
-    //  PrototypeM->print(Os, nullptr, true, true);
-    //  console->error(Os.str());
-    //  console->error("Prototype: {:s} failed verification. Skipping.",
-    //                 PrototypeM->getModuleIdentifier());
-    //  continue;
-    //}
+  llvm::stripDebugInfo(F);
+  llvm::StripDebugInfo(*PrototypeM);
+//if (verifyModule(*PrototypeM, &errs(), &BrokenDbg)) {
+//  // We failed verification, skip this region.
+//  std::string buf;
+//  llvm::raw_string_ostream os(buf);
+//  PrototypeM->print(os, nullptr, true, true);
+//  console->error(os.str());
+//  console->error("Prototype: {:s} failed verification. Skipping.",
+//                  PrototypeM->getModuleIdentifier());
+//  return false;
+//}
 
-    clearFunctionLocalMetadata(ExtractedFromF);
+  clearFunctionLocalMetadata(&F);
 
-    // Make sure that we do not destroy the function before we're done
-    // using the IRBuilder, otherwise this will end poorly.
-    IRBuilder<> Builder(&*(ExtractedFromF->begin()));
-    const std::string ModStr = moduleToString(*PrototypeM);
-    Value *Prototype =
-        Builder.CreateGlobalStringPtr(ModStr, FromName + ".prototype");
+  // Make sure that we do not destroy the function before we're done
+  // using the IRBuilder, otherwise this will end poorly.
+  IRBuilder<> Builder(&*(F.begin()));
+  const std::string ModStr = moduleToString(*PrototypeM);
+  Value *Prototype =
+      Builder.CreateGlobalStringPtr(ModStr, FromName + ".prototype");
 
-    // Persist the resulting prototype for later reuse.
-    // A separate tool should then try to generate a LLVM-lit test that
-    // tries to detect that again.
-    collectRegressionTest(FromName, ModStr);
+  // Persist the resulting prototype for later reuse.
+  // A separate tool should then try to generate a LLVM-lit test that
+  // tries to detect that again.
+  collectRegressionTest(FromName, ModStr);
 
-    InstrumentingFunctionCloner InstCloner;
-    InstCloner.setSource(ProtoF);
-    InstCloner.setPrototype(Prototype);
-    InstCloner.setFallback(ExtractedFromF);
-    InstCloner.setDominatorTree(&DT);
-    InstCloner.setTargetModule(M);
+  InstrumentingFunctionCloner InstCloner;
+  InstCloner.setLoopInfo(this->LI);
+  InstCloner.setSource(ProtoF);
+  InstCloner.setPrototype(Prototype);
+  InstCloner.setFallback(&F);
+  InstCloner.setDominatorTree(&DT);
+  InstCloner.setTargetModule(M);
 
-    Function *InstF = InstCloner.start(VMap, /*RemapCalls=*/true);
-    InstrumentedFunctions.insert(InstF);
-    Instrumented++;
-  }
+  Function *InstF = InstCloner.start(VMap, /*RemapCalls=*/true);
+  InstrumentedFunctions.insert(InstF);
+  Instrumented++;
 
   return true;
 }

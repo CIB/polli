@@ -59,6 +59,7 @@ public:
   virtual void print(llvm::raw_ostream &, const llvm::Module *) const override;
   //@}
 private:
+  LoopInfo *LI;
   llvm::SetVector<llvm::Function *> InstrumentedFunctions;
   //===--------------------------------------------------------------------===//
   // DO NOT IMPLEMENT

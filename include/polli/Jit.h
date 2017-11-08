@@ -71,6 +71,8 @@ public:
    * @{ */
   using CodeCacheT =
       std::unordered_map<CacheKey, llvm::JITSymbol>;
+  using CheckpointPtrT =
+      std::unordered_map<CacheKey, void**>;
   using value_type = std::pair<const CacheKey, llvm::JITSymbol>;
   using iterator = CodeCacheT::iterator;
   using const_iterator = CodeCacheT::const_iterator;
@@ -97,6 +99,7 @@ public:
 
   /**  @} */
 
+  CheckpointPtrT CheckpointPtr;
 private:
   CodeCacheT CodeCache;
 };
