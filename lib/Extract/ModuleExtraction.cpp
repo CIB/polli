@@ -116,6 +116,120 @@ static Function *extractPrototypeM(ValueToValueMapTy &VMap, Function &F,
   return Proto;
 }
 
+
+std::vector<PHINode*> findPhiNodes(LoopInfo* LI, BasicBlock& BB) { 
+  std::vector<PHINode*> RetVal; 
+  for(Instruction &I : BB) { 
+    if(auto Phi = dyn_cast<PHINode>(&I)) { 
+      RetVal.push_back(Phi); 
+    } 
+  } 
+  return RetVal; 
+} 
+ 
+BasicBlock* getLoopHeader(LoopInfo *LI, Function &F) { 
+  // We scan for the header of the outermost loop in the function. 
+  // There should only be one outermost loop in the SCoP function. 
+  for(auto& BB : F) { 
+    if(LI->isLoopHeader(&BB)) { 
+      auto ContainerLoop = LI->getLoopFor(&BB); 
+      if(ContainerLoop->getLoopDepth() == 1) { 
+        return &BB; 
+      } 
+    } 
+  } 
+ 
+  // TODO: put an unreachable here 
+  return NULL; 
+} 
+ 
+/** 
+ * @brief Parametrize lower bounds of function. 
+ */ 
+struct AddLowerBoundsParametersPolicy { 
+private: 
+  LoopInfo *LI; 
+ 
+public: 
+  void MapArguments(ValueToValueMapTy &VMap, Function *From, 
+                    Function *To) { 
+    Function::arg_iterator NewArg = To->arg_begin(); 
+    for (Argument &Arg : From->args()) { 
+      NewArg->setName(Arg.getName()); 
+      VMap[&Arg] = &*(NewArg++); 
+    } 
+ 
+  } 
+ 
+  Function *Create(Function *From, Module *To) { 
+    BasicBlock *loopHeader = getLoopHeader(LI, *From); 
+    std::vector<PHINode*> phiNodes = findPhiNodes(LI, *loopHeader); 
+    ArgListT Args; 
+ 
+    for (auto &Arg : From->args()) 
+      Args.push_back(Arg.getType()); 
+ 
+    for (const PHINode *PV : phiNodes) 
+      Args.push_back(PV->getType()); 
+ 
+    FunctionType *FType = FunctionType::get(From->getReturnType(), Args, false); 
+    Function *F = 
+      Function::Create(FType, From->getLinkage(), From->getName(), To); 
+ 
+    return F; 
+  } 
+ 
+  void setLoopInfo(LoopInfo *LI) { this->LI = LI; } 
+}; 
+ 
+ 
+/** 
+ * @brief Replace the lower bounds of the loop with parameters. 
+ */ 
+struct ParametrizeLowerBounds { 
+private: 
+  LoopInfo *LI1; 
+public: 
+  std::vector<Value*> initialValues; 
+  void setLoopInfo1(LoopInfo *LI) { LI1 = LI; } 
+  void Apply(Function *From, Function *To, ValueToValueMapTy &VMap) { 
+    assert(From && "No source function!"); 
+    assert(To && "No target function!"); 
+ 
+    if (To->isDeclaration()) 
+      return; 
+ 
+    To->addFnAttr("polyjit-parametrized-function");
+    
+    llvm::outs() << "To function: " << *To << "\n"; 
+ 
+    auto loopHeader = getLoopHeader(LI1, *From); 
+    auto loop = LI1->getLoopFor(loopHeader); 
+    auto phiNodes = findPhiNodes(LI1, *loopHeader); 
+ 
+    // First skip the parameters that already exist in the source function. 
+    Function::arg_iterator NewArg = To->arg_begin(); 
+    for (Argument &Arg : From->args()) { 
+      NewArg++; 
+    } 
+ 
+    // Now replace the lower bound of each phi node with the remaining arguments. 
+    for (auto phiNode : phiNodes) { 
+      for(unsigned int i=0; i < phiNode->getNumIncomingValues(); i++) { 
+        if(!loop->contains(phiNode->getIncomingBlock(i))) {
+          // Remember the original incoming value in initialValues
+          initialValues.push_back(phiNode->getIncomingValue(i));
+          auto phiNodeInTarget = dyn_cast<PHINode>(VMap[phiNode]);
+          phiNodeInTarget->setIncomingValue(i, &*NewArg);
+          break; 
+        }
+      }
+      NewArg++;
+    } 
+ 
+  } 
+}; 
+
 /**
  * @brief Endpoint policy that instruments the target Function for PolyJIT
  *
@@ -150,6 +264,8 @@ struct InstrumentEndpoint {
    * @param F The function we use as fallback when the JIT is not ready.
    */
   void setFallback(Function *F) { FallbackF = F; }
+  
+  void setInitialValues(std::vector<Value*> IV) { initialValues = IV; } 
 
   /**
    * @brief Apply the JIT indirection to the target Function.
@@ -227,10 +343,26 @@ struct InstrumentEndpoint {
 
     /* Prepare a stack array for the parameters. We will pass a pointer to
      * this array into our callback function. */
-    int Argc = To->arg_size();
+    int Argc = To->arg_size() + this->initialValues.size();
     Value *ParamC = ConstantInt::get(Type::getInt32Ty(Ctx), Argc);
     ArrayType *StackArrayT = ArrayType::get(Type::getInt8PtrTy(Ctx), Argc);
     Value *Params = Builder.CreateAlloca(StackArrayT, Size1, "params");
+
+    for (llvm::Value *IV : this->initialValues) {
+      /* Get the appropriate slot in the parameters array and store
+       * the stack slot in form of a i8*. */
+      Value *ArrIdx = ConstantInt::get(Type::getInt32Ty(Ctx), I++);
+
+      Value *Slot;
+      /* Allocate a slot on the stack for the i'th argument and store it */
+      Slot = Builder.CreateAlloca(IV->getType(), Size1, "pjit.stack.param");
+      Builder.CreateStore(IV, Slot);
+
+      Value *Dest = Builder.CreateGEP(Params, {Idx0, ArrIdx});
+      Builder.CreateStore(
+          Builder.CreateBitCast(Slot, StackArrayT->getArrayElementType()),
+          Dest);
+    }
 
     for (Argument &Arg : To->args()) {
       /* Get the appropriate slot in the parameters array and store
@@ -272,6 +404,15 @@ struct InstrumentEndpoint {
     Args.push_back(JitIDVal);
     Args.push_back(ParamC);
     Args.push_back(CastParams);
+    
+    // The optimized version of the function will require the lower bounds as arguments.
+    SmallVector<Value *, 3> ToArgsWithLowerBounds;
+    for (auto Arg : this->initialValues) {
+      ToArgsWithLowerBounds.push_back(Arg);
+    }
+    for (auto &Arg : To->args()) {
+      ToArgsWithLowerBounds.push_back(&Arg);
+    }
 
     // Just hand the args from the function down to the source function.
     SmallVector<Value *, 3> ToArgs;
@@ -298,8 +439,8 @@ struct InstrumentEndpoint {
     Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
     // Call the optimized version of the function that was read from
     // PJITCB's return value.
-    Builder.CreateCall(CalledFunctionPointer,
-                       ToArgs);
+    auto CreatedCall = Builder.CreateCall(CalledFunctionPointer,
+                       ToArgsWithLowerBounds);
     Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
     Builder.CreateBr(ExitBlock);
 
@@ -330,6 +471,7 @@ struct InstrumentEndpoint {
   }
 
 private:
+  std::vector<Value*> initialValues;
   LoopInfo *LI;
   Value *PrototypeF;
   Function *FallbackF;
@@ -710,6 +852,8 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     return false;
   if (F.hasFnAttribute("polyjit-jit-candidate"))
     return false;
+  if (F.hasFnAttribute("polyjit-parametrized-function"))
+    return false;
 
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   JITScopDetection &SD = getAnalysis<JITScopDetection>();
@@ -753,7 +897,7 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
 
   if (F.isDeclaration())
     return false;
-  if (!F.hasFnAttribute("polyjit-jit-candidate"))
+  if (!F.hasFnAttribute("polyjit-jit-candidate") || F.hasFnAttribute("polyjit-parametrized-function"))
     return false;
 
   console->info("Instrumenting: {:s}", F.getName().str());
@@ -766,7 +910,15 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
 
   PrototypeM->setModuleIdentifier((ModuleName + "." + FromName).str() +
                                     ".prototype");
-  Function *ProtoF = extractPrototypeM(VMap, F, *PrototypeM);
+
+  ValueToValueMapTy VMap2;
+  FunctionCloner<AddLowerBoundsParametersPolicy, IgnoreSource, ParametrizeLowerBounds> ParametrizeCloner;
+  ParametrizeCloner.setSource(&F);
+  ParametrizeCloner.setLoopInfo(LI);
+  ParametrizeCloner.setLoopInfo1(LI);
+  auto ParametrizedF = ParametrizeCloner.start(VMap2, /*RemapCalls=*/true); 
+
+  Function *ProtoF = extractPrototypeM(VMap, *ParametrizedF, *PrototypeM);
 
   llvm::stripDebugInfo(F);
   llvm::StripDebugInfo(*PrototypeM);
@@ -797,7 +949,8 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
 
   InstrumentingFunctionCloner InstCloner;
   InstCloner.setLoopInfo(this->LI);
-  InstCloner.setSource(ProtoF);
+  InstCloner.setInitialValues(ParametrizeCloner.initialValues); 
+  InstCloner.setSource(&F);
   InstCloner.setPrototype(Prototype);
   InstCloner.setFallback(&F);
   InstCloner.setDominatorTree(&DT);
