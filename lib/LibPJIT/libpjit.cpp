@@ -176,15 +176,15 @@ void pjit_main(const char *fName, void **retFunctionPtr, uint64_t ID,
     return;
   }
 
-  auto CacheResult = JitContext->CheckpointPtr.find(K);
-  if (CacheResult == JitContext->CheckpointPtr.end()) {
+  auto CacheResult = JitContext->find(K);
+  if (CacheResult == JitContext->end()) {
     JitContext->CheckpointPtr.insert(std::make_pair(K, retFunctionPtr)).first;
     *retFunctionPtr = 0;
     auto FutureFn =
       Pool->async(GetOrCreateVariantFunction, Request, ID, K);
   } else {
     JitContext->increment(JitRegion::CACHE_HIT);
-    *retFunctionPtr = CacheResult->second;
+    *retFunctionPtr = (void*) (*CacheResult->second.getAddress());
   }
   pjit_trace_fnstats_exit(JitRegion::CODEGEN);
 
