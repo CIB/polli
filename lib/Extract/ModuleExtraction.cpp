@@ -125,23 +125,7 @@ std::vector<PHINode*> findPhiNodes(LoopInfo* LI, BasicBlock& BB) {
     } 
   } 
   return RetVal; 
-} 
- 
-BasicBlock* getLoopHeader(LoopInfo *LI, Function &F) { 
-  // We scan for the header of the outermost loop in the function. 
-  // There should only be one outermost loop in the SCoP function. 
-  for(auto& BB : F) { 
-    if(LI->isLoopHeader(&BB)) { 
-      auto ContainerLoop = LI->getLoopFor(&BB); 
-      if(ContainerLoop->getLoopDepth() == 1) { 
-        return &BB; 
-      } 
-    } 
-  } 
- 
-  // TODO: put an unreachable here 
-  return NULL; 
-} 
+}
  
 /** 
  * @brief Parametrize lower bounds of function. 
@@ -161,8 +145,8 @@ public:
  
   } 
  
-  Function *Create(Function *From, Module *To) { 
-    BasicBlock *loopHeader = getLoopHeader(LI, *From); 
+  Function *Create(Function *From, Module *To) {
+    BasicBlock *loopHeader = LI->getLoopsInPreorder()[0]->getHeader(); 
     std::vector<PHINode*> phiNodes = findPhiNodes(LI, *loopHeader); 
     ArgListT Args; 
  
@@ -197,13 +181,13 @@ public:
     assert(To && "No target function!"); 
  
     if (To->isDeclaration()) 
-      return; 
+      return;
  
     To->addFnAttr("polyjit-parametrized-function");
     
     llvm::outs() << "To function: " << *To << "\n"; 
  
-    auto loopHeader = getLoopHeader(LI1, *From); 
+    auto loopHeader = LI1->getLoopsInPreorder()[0]->getHeader(); 
     auto loop = LI1->getLoopFor(loopHeader); 
     auto phiNodes = findPhiNodes(LI1, *loopHeader); 
  
