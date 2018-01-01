@@ -199,18 +199,107 @@ public:
  
     // Now replace the lower bound of each phi node with the remaining arguments. 
     for (auto phiNode : phiNodes) { 
-      for(unsigned int i=0; i < phiNode->getNumIncomingValues(); i++) { 
+      for(unsigned int i=0; i < phiNode->getNumIncomingValues(); i++) {
         if(!loop->contains(phiNode->getIncomingBlock(i))) {
           // Remember the original incoming value in initialValues
           initialValues.push_back(phiNode->getIncomingValue(i));
           auto phiNodeInTarget = dyn_cast<PHINode>(VMap[phiNode]);
           phiNodeInTarget->setIncomingValue(i, &*NewArg);
-          break; 
+          break;
         }
       }
       NewArg++;
     } 
  
+  } 
+};
+
+
+
+/** 
+ * @brief Add parameter for the checkpoint condition to the parameters of the function.
+ */ 
+struct AddCheckpointConditionPolicy { 
+public: 
+  void MapArguments(ValueToValueMapTy &VMap, Function *From, 
+                    Function *To) { 
+    Function::arg_iterator NewArg = To->arg_begin(); 
+    for (Argument &Arg : From->args()) { 
+      NewArg->setName(Arg.getName()); 
+      VMap[&Arg] = &*(NewArg++); 
+    } 
+ 
+  } 
+ 
+  Function *Create(Function *From, Module *To) {
+    LLVMContext &Ctx = To->getContext();
+    
+    ArgListT Args; 
+ 
+    for (auto &Arg : From->args()) 
+      Args.push_back(Arg.getType()); 
+ 
+    Args.push_back(Type::getInt64PtrTy(Ctx)->getPointerTo());
+
+    FunctionType *FType = FunctionType::get(From->getReturnType(), Args, false); 
+    Function *F = 
+      Function::Create(FType, From->getLinkage(), From->getName(), To); 
+
+    return F; 
+  }
+};
+
+ 
+/** 
+ * @brief Replace the lower bounds of the loop with parameters. 
+ */ 
+struct AddCheckpointCondition { 
+public:
+  LoopInfo *LI;
+  llvm::Type *functionType;
+
+  void Apply(Function *From, Function *To, ValueToValueMapTy &VMap) { 
+    assert(From && "No source function!"); 
+    assert(To && "No target function!"); 
+ 
+    if (To->isDeclaration()) 
+      return;
+ 
+    To->removeFnAttr("polyjit-jit-candidate");
+    To->addFnAttr("polyjit-checkpointed-fallback");
+ 
+    auto loop = LI->getLoopsInPreorder()[0];
+    auto loopHeader = dyn_cast<BasicBlock>(VMap[loop->getHeader()]);
+    auto phiNode = findPhiNodes(LI, *loopHeader)[0];
+    
+    // After each time the phi node is newly computed, check if the checkpoint condition is
+    // met, and if so, transition into the optimized version of the loop.
+    
+    
+    // Check if the condition pointer still points to a NULL value.
+    // Insert a new block just after the phi instruction
+    IRBuilder<> Builder(loopHeader);
+    Builder.SetInsertPoint(phiNode->getNextNode());
+    
+    auto CondRaw = Builder.CreateLoad(To->args().end()-1, true);
+    LLVMContext &Ctx = To->getContext();
+    auto Cond = Builder.CreateICmp(CmpInst::ICMP_NE, CondRaw, ConstantPointerNull::get(dyn_cast<PointerType>(CondRaw->getType())));
+    auto CondAsInst = dyn_cast<ICmpInst>(Cond);
+ 
+    auto TermInst = llvm::SplitBlockAndInsertIfThen(Cond, CondAsInst->getNextNode(), false, nullptr, nullptr, LI);
+    
+    // Build the optimized version call based on incoming phi value
+    SmallVector<Value *, 3> ToArgs;
+    Builder.SetInsertPoint(TermInst);
+    ToArgs.push_back(phiNode);
+    // Pass through every argument except the last one. The last argument was the pointer to the checkpoint condition.
+    for (auto Arg = To->args().begin(); (Arg+1) != To->args().end(); Arg++) {
+      ToArgs.push_back(&(*Arg));
+    }
+    auto CalledFunctionPtr = Builder.CreateBitCast(CondRaw, this->functionType);
+    Builder.CreateCall(CalledFunctionPtr, ToArgs);
+    
+    TermInst->setSuccessor(0, dyn_cast<BasicBlock>(VMap[loop->getUniqueExitBlock()]));
   } 
 }; 
 
@@ -223,6 +312,8 @@ public:
  *
  */
 struct InstrumentEndpoint {
+  
+  llvm::Type *PrototypeType;
 
   void setLoopInfo(LoopInfo *LI) {
     this->LI = LI;
@@ -293,7 +384,7 @@ struct InstrumentEndpoint {
 
     Function *PJITCB = cast<Function>(M->getOrInsertFunction(
         CallbackName, Void,
-        CharPtr, VoidPtr, Int64T, Int32T, CharPtr));
+        CharPtr, VoidPtr->getPointerTo(), Int64T, Int32T, CharPtr));
     PJITCB->setLinkage(GlobalValue::ExternalLinkage);
 
     Function *TraceFnStatsEntry = cast<Function>(M->getOrInsertFunction(
@@ -378,13 +469,13 @@ struct InstrumentEndpoint {
     Constant *JitIDVal = ConstantInt::get(Int64T, JitID, false);
 
     // Create space on the stack where the JIT will put a pointer to the optimized version of the function.
-    auto CalledFunctionPointerSlot = Builder.CreateAlloca(FallbackF->getType(), Size1, "pjit.stack.optimized_function");
-    
+    auto CalledFunctionPointerSlot = Builder.CreateAlloca(PrototypeType, Size1, "pjit.stack.optimized_function");
+    auto CalledFunctionPointerSlotAsIntPtr = Builder.CreateBitCast(CalledFunctionPointerSlot, Type::getInt64PtrTy(Ctx)->getPointerTo());
 
     SmallVector<Value *, 4> Args;
     Args.push_back((PrototypeF) ? PrototypeF
                                 : Builder.CreateGlobalStringPtr(To->getName()));
-    Args.push_back(CalledFunctionPointerSlot);
+    Args.push_back(CalledFunctionPointerSlotAsIntPtr);
     Args.push_back(JitIDVal);
     Args.push_back(ParamC);
     Args.push_back(CastParams);
@@ -400,6 +491,7 @@ struct InstrumentEndpoint {
 
     // Just hand the args from the function down to the source function.
     SmallVector<Value *, 3> ToArgs;
+    ToArgs.push_back(CalledFunctionPointerSlotAsIntPtr);
     for (auto &Arg : To->args()) {
       ToArgs.push_back(&Arg);
     }
@@ -408,7 +500,7 @@ struct InstrumentEndpoint {
 
     // Load the result from the stack.
     auto CalledFunctionPointer = Builder.CreateLoad(CalledFunctionPointerSlot);
-    auto Cond = Builder.CreateBitCast(CalledFunctionPointer, Type::getInt1Ty(Ctx));
+    auto Cond = Builder.CreateICmp(CmpInst::ICMP_NE, CalledFunctionPointer, ConstantPointerNull::get(dyn_cast<PointerType>(CalledFunctionPointer->getType())));
 
     // Generate blocks for each of the cases we're going to handle.
     BasicBlock *FallbackBlock = BasicBlock::Create(Ctx, "polyjit.fallback", To);
@@ -431,21 +523,20 @@ struct InstrumentEndpoint {
     Builder.SetInsertPoint(FallbackBlock);
 
     Builder.CreateCall(TraceFnStatsEntry, {JitIDVal});
-    // Call the original fallback function unmodified.
-    // TODO: modify the fallback function with checkpointing
-    // and pass a pointer to the checkpoint condition
+    
+    ValueToValueMapTy VMap2;
+    FunctionCloner<AddCheckpointConditionPolicy, IgnoreSource, AddCheckpointCondition> CheckpointCloner;
+    CheckpointCloner.setSource(From);
+    CheckpointCloner.LI = this->LI;
+    CheckpointCloner.functionType = PrototypeType;
+    auto CheckpointedF = CheckpointCloner.start(VMap2, /*RemapCalls=*/true); 
 
-    // Scan for loop header
-    auto Loop = LI->getLoopsInPreorder()[0];
-    llvm::outs() << "Loop: " << *(Loop->getHeader()) << "\n";
-
-    Builder.CreateCall(Builder.CreateBitCast(PtrToOriginalF, FallbackF->getType()),
-                       ToArgs);
+    Builder.CreateCall(CheckpointedF, ToArgs);
     Builder.CreateCall(TraceFnStatsExit, {JitIDVal});
 
     // Once the fallback function is done, we need to alert the PJIT that the
     // stack pointer we passed is no longer valid.
-    Args[1] = Idx0;
+    Args[1] = ConstantPointerNull::get(dyn_cast<PointerType>(Args[1]->getType()));
     Builder.CreateCall(PJITCB, Args);
 
     Builder.CreateBr(ExitBlock);
@@ -838,6 +929,8 @@ bool ModuleExtractor::runOnFunction(Function &F) {
     return false;
   if (F.hasFnAttribute("polyjit-parametrized-function"))
     return false;
+  if (F.hasFnAttribute("polyjit-checkpointed-fallback"))
+    return false;
 
   DominatorTree &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
   JITScopDetection &SD = getAnalysis<JITScopDetection>();
@@ -900,11 +993,13 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
   ParametrizeCloner.setSource(&F);
   ParametrizeCloner.setLoopInfo(LI);
   ParametrizeCloner.setLoopInfo1(LI);
-  auto ParametrizedF = ParametrizeCloner.start(VMap2, /*RemapCalls=*/true); 
+  auto ParametrizedF = ParametrizeCloner.start(VMap2, /*RemapCalls=*/true);
 
   Function *ProtoF = extractPrototypeM(VMap, *ParametrizedF, *PrototypeM);
+  F.addFnAttr("polyjit-id", fmt::format("{:d}", GetCandidateId(*ProtoF)));
 
   llvm::stripDebugInfo(F);
+  llvm::stripDebugInfo(*ParametrizedF);
   llvm::StripDebugInfo(*PrototypeM);
 //if (verifyModule(*PrototypeM, &errs(), &BrokenDbg)) {
 //  // We failed verification, skip this region.
@@ -918,10 +1013,11 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
 //}
 
   clearFunctionLocalMetadata(&F);
+  clearFunctionLocalMetadata(ParametrizedF);
 
   // Make sure that we do not destroy the function before we're done
   // using the IRBuilder, otherwise this will end poorly.
-  IRBuilder<> Builder(&*(F.begin()));
+  IRBuilder<> Builder(&*(ParametrizedF->begin()));
   const std::string ModStr = moduleToString(*PrototypeM);
   Value *Prototype =
       Builder.CreateGlobalStringPtr(ModStr, FromName + ".prototype");
@@ -933,8 +1029,9 @@ bool ModuleInstrumentation::runOnFunction(Function &F) {
 
   InstrumentingFunctionCloner InstCloner;
   InstCloner.setLoopInfo(this->LI);
-  InstCloner.setInitialValues(ParametrizeCloner.initialValues); 
+  InstCloner.setInitialValues(ParametrizeCloner.initialValues);
   InstCloner.setSource(&F);
+  InstCloner.PrototypeType = ParametrizedF->getType();
   InstCloner.setPrototype(Prototype);
   InstCloner.setFallback(&F);
   InstCloner.setDominatorTree(&DT);
